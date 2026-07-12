@@ -25,6 +25,12 @@ from transformers.cache_utils import Cache
 # ---------------------------------------------------------------------------
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
+    """
+    Quyết định các layer của Target Model (Sếp) mà Draft Model (Đệ) sẽ được phép trích xuất thông tin (Hidden states).
+    - Nếu Đệ chỉ có 1 layer: Lấy đúng layer ở giữa của Sếp.
+    - Nếu Đệ có nhiều layer: Trải đều (nội suy tuyến tính) từ layer số 1 đến áp chót của Sếp.
+    Mục đích: Giúp Đệ nhận được đa dạng ngữ nghĩa từ nông đến sâu của Sếp.
+    """
     if num_draft_layers == 1:
         return [num_target_layers // 2]
     start = 1
@@ -40,6 +46,12 @@ def extract_context_feature(
     hidden_states: list[torch.Tensor],
     layer_ids: Optional[list[int]],
 ) -> torch.Tensor:
+    """
+    Hàm "Rút phao cứu sinh" từ Sếp.
+    Lấy toàn bộ trạng thái ẩn (hidden_states) sinh ra từ Sếp, lọc ra các layer chỉ định (layer_ids),
+    và ghép (concatenate) chúng lại dọc theo chiều cuối cùng (dim=-1) thành một Tensor duy nhất.
+    Tensor này chính là 'target_hidden' sẽ được truyền cho Đệ.
+    """
     offset = 1
     selected_states = [hidden_states[layer_id + offset] for layer_id in layer_ids]
     return torch.cat(selected_states, dim=-1)
@@ -71,29 +83,43 @@ def dflash_generate(
     mask_token_id: Optional[int] = None,
     return_stats: bool = False,
 ):
+    """
+    Trái tim của DFlash: Vòng lặp Speculative Decoding (Đoán -> Kiểm duyệt -> Chốt).
+    """
+    # num_input_tokens: Độ dài câu hỏi ban đầu của user
     num_input_tokens = input_ids.shape[1]
+    # max_length: Tổng chiều dài tối đa (câu hỏi + câu trả lời)
     max_length = num_input_tokens + max_new_tokens
     block_size = model.block_size if block_size is None else block_size
     mask_token_id = model.mask_token_id if mask_token_id is None else mask_token_id
 
+    # output_ids: Một mảng trống khổng lồ dùng để điền dần các từ được sinh ra vào.
     output_ids = torch.full(
         (1, max_length + block_size), mask_token_id, dtype=torch.long, device=target.device,
     )
+    # position_ids: Mảng đánh số thứ tự (0, 1, 2, 3...) để model nhận biết vị trí của từng từ trong câu.
     position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
+    
+    # past_key_values: Chính là KV Cache (Bộ nhớ đệm). Lưu lại lịch sử tính toán của các chữ cũ để khỏi tính lại.
+    # Ta cần 2 bộ nhớ riêng biệt cho Sếp (target) và Đệ (draft).
     past_key_values_target = DynamicCache()
     past_key_values_draft = DynamicCache()
 
     prefill_start = _cuda_time() if return_stats else None
+    
+    # 1. PREFILL PHASE: Cho ông Sếp (target) đọc toàn bộ câu hỏi (input_ids) trước.
+    # Mục đích là lấy từ đầu tiên và quan trọng nhất là lấy trạng thái ẩn (target_hidden) làm 'phao' đầu tiên.
     output = target(
-        input_ids,
-        position_ids=position_ids[:, :num_input_tokens],
-        past_key_values=past_key_values_target,
+        input_ids, # Đầu vào là câu hỏi
+        position_ids=position_ids[:, :num_input_tokens], # Vị trí của câu hỏi
+        past_key_values=past_key_values_target, # Lưu kết quả tính toán vào bộ nhớ đệm của Sếp
         use_cache=True,
-        logits_to_keep=1,
-        output_hidden_states=block_size > 1,
+        logits_to_keep=1, # Chỉ giữ lại bảng xác suất (logits) của chữ cuối cùng để tiết kiệm RAM
+        output_hidden_states=block_size > 1, # Yêu cầu Sếp phải nôn ra trạng thái ẩn (hidden states) để làm phao
     )
 
     output_ids[:, :num_input_tokens] = input_ids
+    # Lấy chữ đầu tiên do Sếp rặn ra điền vào mảng kết quả
     output_ids[:, num_input_tokens:num_input_tokens + 1] = sample(output.logits, temperature)
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
@@ -104,16 +130,24 @@ def dflash_generate(
     start = num_input_tokens
     draft_prefill = True
 
+    # 2. VÒNG LẶP CHÍNH (DECODE PHASE)
     while start < max_length:
+        # block_output_ids: Khung chứa tạm thời cho cụm từ sắp được nháp (độ dài = block_size)
         block_output_ids = output_ids[:, start : start + block_size].clone()
         block_position_ids = position_ids[:, start : start + block_size]
         if block_size > 1:
+            # 2a. DRAFTING: Thằng Đệ sinh ra một đoạn nháp dài 'block_size' (ví dụ 16 từ).
+            # Lưu ý nó truyền 'target_hidden' (phao của Sếp) vào để tính toán.
+            
+            # noise_embedding: Biến các ID (mã số) của cụm từ nháp thành các vector toán học (embedding)
             noise_embedding = target.model.embed_tokens(block_output_ids)
+            
+            # draft_logits: Xác suất (tỷ lệ phần trăm) do thằng Đệ dự đoán cho các chữ tiếp theo
             draft_logits = target.lm_head(model(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
+                target_hidden=target_hidden, # Phao của Sếp
+                noise_embedding=noise_embedding, # Vector của từ nháp
                 position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + block_size],
-                past_key_values=past_key_values_draft,
+                past_key_values=past_key_values_draft, # Lưu lịch sử vào bộ nhớ đệm của Đệ
                 use_cache=True,
                 is_causal=False,
             )[:, 1 - block_size :, :])
@@ -123,16 +157,23 @@ def dflash_generate(
                 draft_prefill = False
                 decode_start = _cuda_time()
 
+        # 2b. VERIFYING: Ném nguyên cụm 16 chữ nháp đó cho Sếp (target) chạy kiểm tra song song (1 lượt forward).
         output = target(
-            block_output_ids,
+            block_output_ids, # Input bây giờ là 16 chữ nháp của Đệ
             position_ids=block_position_ids,
-            past_key_values=past_key_values_target,
+            past_key_values=past_key_values_target, # Tiếp tục lưu lịch sử vào bộ nhớ đệm của Sếp
             use_cache=True,
-            output_hidden_states=block_size > 1,
+            output_hidden_states=block_size > 1, # Lại yêu cầu Sếp nôn ra hidden states để chốc nữa làm phao mới
         )
 
+        # posterior: Đáp án chuẩn (xác suất các chữ tiếp theo) do Sếp tự tính toán ra. Dùng để đối chiếu.
         posterior = sample(output.logits, temperature)
+        
+        # 2c. ACCEPTANCE: Trọng tài đối chiếu từng chữ. 
+        # Khớp đến đoạn nào thì chốt chiều dài đến đoạn đó (acceptance_length).
         acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        
+        # Cập nhật kết quả cuối cùng: Lấy mảng nháp đã duyệt thành công + thêm 1 chữ do Sếp sửa/chốt.
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
         start += acceptance_length + 1
@@ -140,6 +181,7 @@ def dflash_generate(
         acceptance_lengths.append(acceptance_length + 1)
 
         if block_size > 1:
+            # 2d. CẬP NHẬT PHAO: Rút trích target_hidden mới từ những chữ vừa duyệt thành công để dùng cho vòng lặp sau.
             target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)[:, :acceptance_length + 1, :]
 
         if stop_token_ids is not None and any(
@@ -220,15 +262,26 @@ class Qwen3DFlashAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
+        
+        # Truy vấn (Query) của thằng Đệ: Câu hỏi hiện tại nó đang muốn tìm ngữ cảnh.
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
+        
+        # BÍ THUẬT CỦA DFLASH Ở ĐÂY:
+        # Tính K (Key - Từ khóa), V (Value - Nội dung) từ 'target_hidden' (phao của Sếp)
         k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
         v_ctx = self.v_proj(target_hidden)
+        
+        # Tính K, V từ 'hidden_states' (dữ liệu hiện tại của chính Đệ)
+        k_noise = self.k_proj(hidden_states)
         v_noise = self.v_proj(hidden_states)
+        
+        # Ghép (Cat) K và V của cả Sếp và Đệ lại với nhau.
+        # Từ nay thằng Đệ sẽ tra cứu thông tin (Attention) trên cả 2 nguồn này cùng lúc (Cross-Attention).
         k = torch.cat([k_ctx, k_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
         v = torch.cat([v_ctx, v_noise], dim=1).view(bsz, ctx_len + q_len, -1, self.head_dim)
+        
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
@@ -314,6 +367,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
+        
+        # Lớp FC (Fully Connected) này dùng để ép (nén) cái 'target_hidden' khổng lồ 
+        # (do bị ghép từ nhiều layer của Sếp) về lại đúng kích thước não (hidden_size) của Đệ.
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
