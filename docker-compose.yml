@@ -25,6 +25,7 @@ services:
     
     # 7. Map thư mục Cache từ Server vào Container (Tương đương cờ --mount type=bind)
     volumes:
+      - /home/phunq/5080_cuda13/venv:/opt/venv
       - ~/5080_cuda13/dflash:/workspace/dflash
       - ~/.cache/uv:/root/.cache/uv
       - ~/.cache/huggingface:/root/.cache/huggingface
