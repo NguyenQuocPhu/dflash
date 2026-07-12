@@ -30,11 +30,13 @@ DATASETS = {
         "load_args": ("openai/gsm8k", "main"),
         "load_kwargs": {"split": "test"},
         "format": lambda x: "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}.".format(**x),
+        "reference": lambda x: x["answer"].split("####")[-1].strip() if "####" in x["answer"] else x["answer"],
     },
     "math500": {
         "load_args": ("HuggingFaceH4/MATH-500",),
         "load_kwargs": {"split": "test"},
         "format": lambda x: "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}.".format(**x),
+        "reference": lambda x: str(x["answer"]),
     },
     "humaneval": {
         "load_args": ("openai/openai_humaneval",),
@@ -60,7 +62,7 @@ def _prepare_dataset(name: str) -> Path:
 
     cfg = DATASETS[name]
     CACHE_DIR.mkdir(exist_ok=True)
-    out_path = CACHE_DIR / f"{name}.jsonl"
+    out_path = CACHE_DIR / f"{name}_v2.jsonl"
     tmp_path = out_path.with_name(f"{out_path.name}.{os.getpid()}.tmp")
 
     print(f"[download] {name} ...")
@@ -72,7 +74,10 @@ def _prepare_dataset(name: str) -> Path:
                 turns = cfg["format"](row)
             else:
                 turns = [cfg["format"](row)]
-            f.write(json.dumps({"turns": turns}) + "\n")
+            item = {"turns": turns}
+            if "reference" in cfg:
+                item["reference"] = cfg["reference"](row)
+            f.write(json.dumps(item) + "\n")
     os.replace(tmp_path, out_path)
 
     with open(out_path) as f:
@@ -85,7 +90,7 @@ def load_and_process_dataset(data_name: str) -> list[dict]:
     if data_name not in DATASETS:
         raise ValueError(f"Unknown dataset '{data_name}'. Available: {list(DATASETS.keys())}")
 
-    path = CACHE_DIR / f"{data_name}.jsonl"
+    path = CACHE_DIR / f"{data_name}_v2.jsonl"
     if not path.exists():
         _prepare_dataset(data_name)
 
@@ -98,6 +103,35 @@ def _limit_dataset(dataset: list[dict], max_samples: int | None) -> list[dict]:
         return dataset
     random.shuffle(dataset)
     return dataset[:max_samples]
+
+
+def extract_answer(text: str) -> str | None:
+    idx = text.rfind("\\boxed{")
+    if idx == -1:
+        return None
+    
+    idx += len("\\boxed{")
+    brace_count = 1
+    for i in range(idx, len(text)):
+        if text[i] == "{":
+            brace_count += 1
+        elif text[i] == "}":
+            brace_count -= 1
+        
+        if brace_count == 0:
+            return text[idx:i].strip()
+    return None
+
+
+def judge_correctness(model_output: str, reference: str) -> bool:
+    ans = extract_answer(model_output)
+    if ans is None:
+        return False
+    
+    def normalize(s: str) -> str:
+        return re.sub(r"[\s,\$]", "", s).lower()
+        
+    return normalize(ans) == normalize(reference)
 
 
 def _apply_chat_template(tokenizer, messages: list[dict], enable_thinking: bool) -> str:
@@ -231,6 +265,8 @@ def _run_transformers(args: argparse.Namespace) -> None:
     dataset = _limit_dataset(dataset, args.max_samples)
 
     responses = []
+    correct_count = 0
+    total_eval = 0
     indices = range(_dist_rank(), len(dataset), _dist_size())
     for idx in tqdm(indices, disable=not _dist_is_main()):
         instance = dataset[idx]
@@ -259,13 +295,23 @@ def _run_transformers(args: argparse.Namespace) -> None:
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
 
+            if "reference" in instance:
+                if judge_correctness(output_text, instance["reference"]):
+                    correct_count += 1
+                total_eval += 1
+
     if _dist_size() > 1:
         responses = _dist_gather(torch_dist, responses, dst=0)
+        eval_stats = _dist_gather(torch_dist, (correct_count, total_eval), dst=0)
         if not _dist_is_main():
             return
         responses = list(chain(*responses))
+        correct_count = sum(s[0] for s in eval_stats)
+        total_eval = sum(s[1] for s in eval_stats)
 
     _print_decode_summary(responses, block_size)
+    if total_eval > 0:
+        print(f"Accuracy: {correct_count / total_eval * 100:.2f}% ({correct_count}/{total_eval})")
 
 
 def _send_sglang(
@@ -348,6 +394,8 @@ def _run_mlx(args: argparse.Namespace) -> None:
     list(stream_generate(model, draft, tokenizer, warmup_prompt, block_size, 3, sampler=sampler))
 
     responses = []
+    correct_count = 0
+    total_eval = 0
     for idx in tqdm(range(len(dataset))):
         instance = dataset[idx]
         messages = []
@@ -374,7 +422,14 @@ def _run_mlx(args: argparse.Namespace) -> None:
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
 
+            if "reference" in instance:
+                if judge_correctness(output_text, instance["reference"]):
+                    correct_count += 1
+                total_eval += 1
+
     _print_decode_summary(responses, block_size)
+    if total_eval > 0:
+        print(f"Accuracy: {correct_count / total_eval * 100:.2f}% ({correct_count}/{total_eval})")
 
 
 def _run_server(args: argparse.Namespace) -> None:
@@ -387,18 +442,20 @@ def _run_server(args: argparse.Namespace) -> None:
         tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     num_prompts = args.num_prompts + args.concurrency
-    prompts: list[str] = []
+    prompts_with_refs = []
     for i in range(num_prompts):
         item = dataset[i % len(dataset)]
         user_content = item["turns"][0]
+        ref = item.get("reference")
+        
         if is_vllm:
-            prompts.append(user_content)
+            prompts_with_refs.append((user_content, ref))
         else:
-            prompts.append(_apply_chat_template(
+            prompts_with_refs.append((_apply_chat_template(
                 tokenizer,
                 [{"role": "user", "content": user_content}],
                 args.enable_thinking,
-            ))
+            ), ref))
 
     def send_one(prompt: str) -> dict:
         if is_vllm:
@@ -430,22 +487,37 @@ def _run_server(args: argparse.Namespace) -> None:
             print("Warning: /flush_cache failed. Continuing.")
 
     bs = max(args.concurrency, 1)
-    if len(prompts) > bs:
+    if len(prompts_with_refs) > bs:
         print(f"[warmup] {bs} requests ...")
         with ThreadPoolExecutor(max_workers=bs) as pool:
-            list(pool.map(send_one, prompts[:bs]))
-        prompts = prompts[bs:]
+            list(pool.map(send_one, [p[0] for p in prompts_with_refs[:bs]]))
+        prompts_with_refs = prompts_with_refs[bs:]
 
     print(f"Running benchmark: {args.num_prompts} prompts, concurrency={args.concurrency} ...")
     start = time.perf_counter()
     total_tokens = 0
     spec_verify_ct_sum = 0
     spec_accept_lengths: list[float] = []
+    correct_count = 0
+    total_eval = 0
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = {pool.submit(send_one, p): i for i, p in enumerate(prompts)}
-        for fut in tqdm(as_completed(futures), total=len(prompts), desc="Benchmarking"):
+        futures = {pool.submit(send_one, p[0]): p[1] for p in prompts_with_refs}
+        for fut in tqdm(as_completed(futures), total=len(prompts_with_refs), desc="Benchmarking"):
+            ref = futures[fut]
             out = fut.result()
+            
+            output_text = ""
+            if is_vllm:
+                if "choices" in out and len(out["choices"]) > 0:
+                    output_text = out["choices"][0].get("message", {}).get("content", "")
+            else:
+                output_text = out.get("text", "")
+            
+            if ref is not None:
+                if judge_correctness(output_text, ref):
+                    correct_count += 1
+                total_eval += 1
             if is_vllm:
                 usage = out.get("usage", {})
                 total_tokens += int(usage.get("completion_tokens", 0))
@@ -474,6 +546,8 @@ def _run_server(args: argparse.Namespace) -> None:
         print(f"Accept length:    {statistics.mean(spec_accept_lengths):.3f}")
     if spec_verify_ct_sum > 0:
         print(f"Spec verify ct:   {spec_verify_ct_sum}")
+    if total_eval > 0:
+        print(f"Accuracy:         {correct_count / total_eval * 100:.2f}% ({correct_count}/{total_eval})")
     print(f"{'=' * 50}")
 
 
