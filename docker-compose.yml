@@ -25,7 +25,7 @@ services:
     
     # 7. Map thư mục Cache từ Server vào Container (Tương đương cờ --mount type=bind)
     volumes:
-      - ~/dflash:/workspace/dflash
+      - ~:/workspace/dflash
       - ~/.cache/uv:/root/.cache/uv
       - ~/.cache/huggingface:/root/.cache/huggingface
     
