@@ -30,8 +30,9 @@ DATASETS = {
     "gsm8k": {
         "load_args": ("openai/gsm8k", "main"),
         "load_kwargs": {"split": "test"},
-        "format": lambda x: "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}.".format(**x),
+        "format": lambda x: "{question}\nPlease reason step by step, and put your final numeric answer after ####.".format(**x),
         "reference": lambda x: x["answer"].split("####")[-1].strip() if "####" in x["answer"] else x["answer"],
+        "cache_version": 3,
     },
     "math500": {
         "load_args": ("HuggingFaceH4/MATH-500",),
@@ -57,13 +58,20 @@ DATASETS = {
     },
 }
 
+_GSM8K_ANSWER_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+
+
+def _dataset_cache_path(name: str) -> Path:
+    version = DATASETS[name].get("cache_version", 2)
+    return CACHE_DIR / f"{name}_v{version}.jsonl"
+
 
 def _prepare_dataset(name: str) -> Path:
     from datasets import load_dataset
 
     cfg = DATASETS[name]
     CACHE_DIR.mkdir(exist_ok=True)
-    out_path = CACHE_DIR / f"{name}_v2.jsonl"
+    out_path = _dataset_cache_path(name)
     tmp_path = out_path.with_name(f"{out_path.name}.{os.getpid()}.tmp")
 
     print(f"[download] {name} ...")
@@ -91,7 +99,7 @@ def load_and_process_dataset(data_name: str) -> list[dict]:
     if data_name not in DATASETS:
         raise ValueError(f"Unknown dataset '{data_name}'. Available: {list(DATASETS.keys())}")
 
-    path = CACHE_DIR / f"{data_name}_v2.jsonl"
+    path = _dataset_cache_path(data_name)
     if not path.exists():
         _prepare_dataset(data_name)
 
@@ -146,18 +154,11 @@ def _parse_reference(reference: str):
     )
 
 
-@lru_cache(maxsize=1)
-def _get_gsm8k_metric():
-    from math_verify.metric import math_metric
-    from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
-
-    return math_metric(
-        gold_extraction_target=(ExprExtractionConfig(),),
-        pred_extraction_target=(
-            LatexExtractionConfig(),
-            ExprExtractionConfig(),
-        ),
-    )
+def _extract_gsm8k_answer(text: str) -> str | None:
+    match = _GSM8K_ANSWER_RE.search(text)
+    if match is None:
+        return None
+    return match.group(1).strip().replace(",", "")
 
 
 def judge_correctness(model_output: str, reference: str, dataset_name: str) -> bool:
@@ -166,8 +167,9 @@ def judge_correctness(model_output: str, reference: str, dataset_name: str) -> b
         return False
 
     if dataset_name == "gsm8k":
-        score, _ = _get_gsm8k_metric()([reference], [model_output])
-        return score == 1.0
+        predicted_answer = _extract_gsm8k_answer(model_output)
+        reference_answer = reference.strip().replace(",", "")
+        return predicted_answer is not None and predicted_answer == reference_answer
 
     try:
         from math_verify import parse, verify
