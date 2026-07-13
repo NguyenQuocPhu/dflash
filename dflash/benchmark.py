@@ -25,6 +25,7 @@ random.seed(42)
 
 
 CACHE_DIR = Path(__file__).parent.parent / "cache"
+_GSM8K_NUMBER_RE = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
 
 DATASETS = {
     "gsm8k": {
@@ -32,10 +33,12 @@ DATASETS = {
         "load_kwargs": {"split": "test"},
         "format": lambda x: (
             "{question}\nSolve the problem step by step. Put the reasoning inside "
-            "<think>...</think> and the direct answer inside <answer>...</answer>."
+            "<think>...</think>. Put exactly one number inside <answer>...</answer> "
+            "(for example, <answer>160</answer>). Do not include units, words, "
+            "currency symbols, equations, or any other text inside <answer>."
         ).format(**x),
         "reference": lambda x: x["answer"].split("####")[-1].strip() if "####" in x["answer"] else x["answer"],
-        "cache_version": 4,
+        "cache_version": 5,
     },
     "math500": {
         "load_args": ("HuggingFaceH4/MATH-500",),
@@ -159,7 +162,10 @@ def _extract_gsm8k_answer(text: str) -> str | None:
     if "<answer>" not in text or "</answer>" not in text:
         return None
     answer = text.rsplit("<answer>", 1)[-1]
-    return answer.split("</answer>", 1)[0].strip()
+    answer = answer.split("</answer>", 1)[0].strip()
+    if _GSM8K_NUMBER_RE.fullmatch(answer) is None:
+        return None
+    return answer
 
 
 def judge_correctness(model_output: str, reference: str, dataset_name: str) -> bool:
@@ -169,8 +175,7 @@ def judge_correctness(model_output: str, reference: str, dataset_name: str) -> b
 
     if dataset_name == "gsm8k":
         predicted_answer = _extract_gsm8k_answer(model_output)
-        reference_answer = reference.strip()
-        return predicted_answer is not None and predicted_answer == reference_answer
+        return predicted_answer is not None and predicted_answer == reference.strip()
 
     try:
         from math_verify import parse, verify
