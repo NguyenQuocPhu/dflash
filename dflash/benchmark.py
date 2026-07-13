@@ -146,10 +146,28 @@ def _parse_reference(reference: str):
     )
 
 
-def judge_correctness(model_output: str, reference: str) -> bool:
+@lru_cache(maxsize=1)
+def _get_gsm8k_metric():
+    from math_verify.metric import math_metric
+    from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+
+    return math_metric(
+        gold_extraction_target=(ExprExtractionConfig(),),
+        pred_extraction_target=(
+            LatexExtractionConfig(),
+            ExprExtractionConfig(),
+        ),
+    )
+
+
+def judge_correctness(model_output: str, reference: str, dataset_name: str) -> bool:
     """Grade boxed math answers using symbolic/numeric equivalence."""
     if not isinstance(model_output, str) or not isinstance(reference, str):
         return False
+
+    if dataset_name == "gsm8k":
+        score, _ = _get_gsm8k_metric()([reference], [model_output])
+        return score == 1.0
 
     try:
         from math_verify import parse, verify
@@ -330,7 +348,7 @@ def _run_transformers(args: argparse.Namespace) -> None:
             responses.append(response)
 
             if "reference" in instance:
-                if judge_correctness(output_text, instance["reference"]):
+                if judge_correctness(output_text, instance["reference"], args.dataset):
                     correct_count += 1
                 total_eval += 1
 
@@ -457,7 +475,7 @@ def _run_mlx(args: argparse.Namespace) -> None:
             responses.append(response)
 
             if "reference" in instance:
-                if judge_correctness(output_text, instance["reference"]):
+                if judge_correctness(output_text, instance["reference"], args.dataset):
                     correct_count += 1
                 total_eval += 1
 
@@ -549,7 +567,7 @@ def _run_server(args: argparse.Namespace) -> None:
                 output_text = out.get("text", "")
             
             if ref is not None:
-                if judge_correctness(output_text, ref):
+                if judge_correctness(output_text, ref, args.dataset):
                     correct_count += 1
                 total_eval += 1
             if is_vllm:
