@@ -30,9 +30,12 @@ DATASETS = {
     "gsm8k": {
         "load_args": ("openai/gsm8k", "main"),
         "load_kwargs": {"split": "test"},
-        "format": lambda x: "{question}\nPlease reason step by step, and put your final numeric answer after ####.".format(**x),
+        "format": lambda x: (
+            "{question}\nSolve the problem step by step. Put the reasoning inside "
+            "<think>...</think> and the direct answer inside <answer>...</answer>."
+        ).format(**x),
         "reference": lambda x: x["answer"].split("####")[-1].strip() if "####" in x["answer"] else x["answer"],
-        "cache_version": 3,
+        "cache_version": 4,
     },
     "math500": {
         "load_args": ("HuggingFaceH4/MATH-500",),
@@ -57,8 +60,6 @@ DATASETS = {
         "multi_turn": True,
     },
 }
-
-_GSM8K_ANSWER_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
 
 
 def _dataset_cache_path(name: str) -> Path:
@@ -155,20 +156,20 @@ def _parse_reference(reference: str):
 
 
 def _extract_gsm8k_answer(text: str) -> str | None:
-    match = _GSM8K_ANSWER_RE.search(text)
-    if match is None:
+    if "<answer>" not in text or "</answer>" not in text:
         return None
-    return match.group(1).strip().replace(",", "")
+    answer = text.rsplit("<answer>", 1)[-1]
+    return answer.split("</answer>", 1)[0].strip()
 
 
 def judge_correctness(model_output: str, reference: str, dataset_name: str) -> bool:
-    """Grade boxed math answers using symbolic/numeric equivalence."""
+    """Grade a model response using the selected dataset's answer format."""
     if not isinstance(model_output, str) or not isinstance(reference, str):
         return False
 
     if dataset_name == "gsm8k":
         predicted_answer = _extract_gsm8k_answer(model_output)
-        reference_answer = reference.strip().replace(",", "")
+        reference_answer = reference.strip()
         return predicted_answer is not None and predicted_answer == reference_answer
 
     try:
