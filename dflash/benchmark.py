@@ -189,6 +189,20 @@ def judge_correctness(model_output: str, reference: str, dataset_name: str) -> b
         return _judge_exact_match(model_output, reference)
 
 
+def _print_evaluation_sample(
+    question: str,
+    reference: str,
+    model_output: str,
+    is_correct: bool,
+) -> None:
+    print(f"\n{'=' * 80}")
+    print(f"Question:\n{question}")
+    print(f"\nReference answer:\n{reference}")
+    print(f"\nLLM output:\n{model_output}")
+    print(f"\nResult: {'CORRECT' if is_correct else 'INCORRECT'}")
+    print(f"{'=' * 80}")
+
+
 def _apply_chat_template(tokenizer, messages: list[dict], enable_thinking: bool) -> str:
     return tokenizer.apply_chat_template(
         messages,
@@ -351,9 +365,17 @@ def _run_transformers(args: argparse.Namespace) -> None:
             responses.append(response)
 
             if "reference" in instance:
-                if judge_correctness(output_text, instance["reference"], args.dataset):
+                is_correct = judge_correctness(output_text, instance["reference"], args.dataset)
+                if is_correct:
                     correct_count += 1
                 total_eval += 1
+                if args.print_samples:
+                    _print_evaluation_sample(
+                        user_content,
+                        instance["reference"],
+                        output_text,
+                        is_correct,
+                    )
 
     if _dist_size() > 1:
         responses = _dist_gather(torch_dist, responses, dst=0)
@@ -478,9 +500,17 @@ def _run_mlx(args: argparse.Namespace) -> None:
             responses.append(response)
 
             if "reference" in instance:
-                if judge_correctness(output_text, instance["reference"], args.dataset):
+                is_correct = judge_correctness(output_text, instance["reference"], args.dataset)
+                if is_correct:
                     correct_count += 1
                 total_eval += 1
+                if args.print_samples:
+                    _print_evaluation_sample(
+                        user_content,
+                        instance["reference"],
+                        output_text,
+                        is_correct,
+                    )
 
     _print_decode_summary(responses, block_size)
     if total_eval > 0:
@@ -504,13 +534,17 @@ def _run_server(args: argparse.Namespace) -> None:
         ref = item.get("reference")
         
         if is_vllm:
-            prompts_with_refs.append((user_content, ref))
+            prompts_with_refs.append((user_content, ref, user_content))
         else:
-            prompts_with_refs.append((_apply_chat_template(
-                tokenizer,
-                [{"role": "user", "content": user_content}],
-                args.enable_thinking,
-            ), ref))
+            prompts_with_refs.append((
+                _apply_chat_template(
+                    tokenizer,
+                    [{"role": "user", "content": user_content}],
+                    args.enable_thinking,
+                ),
+                ref,
+                user_content,
+            ))
 
     def send_one(prompt: str) -> dict:
         if is_vllm:
@@ -557,9 +591,9 @@ def _run_server(args: argparse.Namespace) -> None:
     total_eval = 0
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = {pool.submit(send_one, p[0]): p[1] for p in prompts_with_refs}
+        futures = {pool.submit(send_one, p[0]): (p[1], p[2]) for p in prompts_with_refs}
         for fut in tqdm(as_completed(futures), total=len(prompts_with_refs), desc="Benchmarking"):
-            ref = futures[fut]
+            ref, question = futures[fut]
             out = fut.result()
             
             output_text = ""
@@ -570,9 +604,12 @@ def _run_server(args: argparse.Namespace) -> None:
                 output_text = out.get("text", "")
             
             if ref is not None:
-                if judge_correctness(output_text, ref, args.dataset):
+                is_correct = judge_correctness(output_text, ref, args.dataset)
+                if is_correct:
                     correct_count += 1
                 total_eval += 1
+                if args.print_samples:
+                    _print_evaluation_sample(question, ref, output_text, is_correct)
             if is_vllm:
                 usage = out.get("usage", {})
                 total_tokens += int(usage.get("completion_tokens", 0))
@@ -624,6 +661,7 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument("--print-samples", action="store_true")
     parser.add_argument("--timeout-s", type=int, default=3600)
 
     args = parser.parse_args()
