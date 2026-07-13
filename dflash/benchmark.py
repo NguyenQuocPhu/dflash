@@ -9,6 +9,7 @@ import statistics
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,15 +124,48 @@ def extract_answer(text: str) -> str | None:
     return None
 
 
-def judge_correctness(model_output: str, reference: str) -> bool:
+def _judge_exact_match(model_output: str, reference: str) -> bool:
     ans = extract_answer(model_output)
     if ans is None:
         return False
-    
+
     def normalize(s: str) -> str:
         return re.sub(r"[\s,\$]", "", s).lower()
-        
+
     return normalize(ans) == normalize(reference)
+
+
+@lru_cache(maxsize=None)
+def _parse_reference(reference: str):
+    from math_verify import parse
+    from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+
+    return parse(
+        reference,
+        extraction_config=[LatexExtractionConfig(), ExprExtractionConfig()],
+    )
+
+
+def judge_correctness(model_output: str, reference: str) -> bool:
+    """Grade boxed math answers using symbolic/numeric equivalence."""
+    if not isinstance(model_output, str) or not isinstance(reference, str):
+        return False
+
+    try:
+        from math_verify import parse, verify
+        from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+
+        gold = _parse_reference(reference)
+        answer = parse(
+            model_output,
+            extraction_config=[
+                LatexExtractionConfig(boxed_match_priority=0),
+                ExprExtractionConfig(),
+            ],
+        )
+        return bool(verify(gold, answer))
+    except Exception:
+        return _judge_exact_match(model_output, reference)
 
 
 def _apply_chat_template(tokenizer, messages: list[dict], enable_thinking: bool) -> str:
