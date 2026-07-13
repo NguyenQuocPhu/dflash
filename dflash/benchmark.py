@@ -19,6 +19,7 @@ import numpy as np
 import requests
 from loguru import logger
 from rich import print
+from rich.table import Table
 from tqdm import tqdm
 
 random.seed(42)
@@ -225,6 +226,76 @@ def _make_decode_metrics(num_output_tokens: int, generation_tps: float, acceptan
     )
 
 
+def _input_token_bucket(num_tokens: int) -> tuple[int, str]:
+    if num_tokens < 128:
+        return 0, "0-127"
+
+    lower = 128
+    while num_tokens >= lower * 2:
+        lower *= 2
+    return lower, f"{lower}-{lower * 2 - 1}"
+
+
+def _make_speed_profile(input_tokens: int, **metrics: SimpleNamespace) -> dict:
+    profile = {"input_tokens": int(input_tokens), "series": {}}
+    for label, metric in metrics.items():
+        output_tokens = int(metric.num_output_tokens)
+        generation_time = output_tokens * float(metric.time_per_output_token)
+        profile["series"][label] = (output_tokens, generation_time)
+    return profile
+
+
+def _print_input_speed_report(profiles: list[dict], labels: list[str]) -> None:
+    if not profiles:
+        return
+
+    grouped: dict[int, dict] = {}
+    for profile in profiles:
+        input_tokens = int(profile["input_tokens"])
+        bucket_start, bucket_label = _input_token_bucket(input_tokens)
+        group = grouped.setdefault(
+            bucket_start,
+            {"label": bucket_label, "input_tokens": [], "series": {}},
+        )
+        group["input_tokens"].append(input_tokens)
+        for label, (output_tokens, generation_time) in profile["series"].items():
+            totals = group["series"].setdefault(label, [0, 0.0])
+            if output_tokens > 0 and np.isfinite(generation_time) and generation_time > 0:
+                totals[0] += output_tokens
+                totals[1] += generation_time
+
+    table = Table(title="Generation speed by input length")
+    table.add_column("Input tokens", justify="right")
+    table.add_column("Prompts", justify="right")
+    table.add_column("Avg input", justify="right")
+    for label in labels:
+        table.add_column(f"{label} tok/s", justify="right")
+    if labels == ["Baseline", "DFlash"]:
+        table.add_column("Speedup", justify="right")
+
+    for bucket_start in sorted(grouped):
+        group = grouped[bucket_start]
+        speeds: dict[str, float | None] = {}
+        row = [
+            group["label"],
+            str(len(group["input_tokens"])),
+            f"{statistics.mean(group['input_tokens']):.1f}",
+        ]
+        for label in labels:
+            output_tokens, generation_time = group["series"].get(label, (0, 0.0))
+            speed = output_tokens / generation_time if generation_time > 0 else None
+            speeds[label] = speed
+            row.append(f"{speed:.2f}" if speed is not None else "-")
+        if labels == ["Baseline", "DFlash"]:
+            baseline = speeds["Baseline"]
+            dflash = speeds["DFlash"]
+            speedup = dflash / baseline if baseline and dflash is not None else None
+            row.append(f"{speedup:.2f}x" if speedup is not None else "-")
+        table.add_row(*row)
+
+    print(table)
+
+
 def _print_decode_summary(responses: list[dict[int, SimpleNamespace]], block_size: int) -> None:
     baseline_tpot = np.mean([r[1].time_per_output_token for r in responses])
     dflash_tpot = np.mean([r[block_size].time_per_output_token for r in responses])
@@ -339,6 +410,7 @@ def _run_transformers(args: argparse.Namespace) -> None:
     dataset = _limit_dataset(dataset, args.max_samples)
 
     responses = []
+    speed_profiles = []
     correct_count = 0
     total_eval = 0
     indices = range(_dist_rank(), len(dataset), _dist_size())
@@ -368,6 +440,11 @@ def _run_transformers(args: argparse.Namespace) -> None:
             output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
+            speed_profiles.append(_make_speed_profile(
+                input_ids.shape[-1],
+                Baseline=response[1],
+                DFlash=response[block_size],
+            ))
 
             if "reference" in instance:
                 is_correct = judge_correctness(output_text, instance["reference"], args.dataset)
@@ -384,14 +461,17 @@ def _run_transformers(args: argparse.Namespace) -> None:
 
     if _dist_size() > 1:
         responses = _dist_gather(torch_dist, responses, dst=0)
+        speed_profiles = _dist_gather(torch_dist, speed_profiles, dst=0)
         eval_stats = _dist_gather(torch_dist, (correct_count, total_eval), dst=0)
         if not _dist_is_main():
             return
         responses = list(chain(*responses))
+        speed_profiles = list(chain(*speed_profiles))
         correct_count = sum(s[0] for s in eval_stats)
         total_eval = sum(s[1] for s in eval_stats)
 
     _print_decode_summary(responses, block_size)
+    _print_input_speed_report(speed_profiles, ["Baseline", "DFlash"])
     if total_eval > 0:
         print(f"Accuracy: {correct_count / total_eval * 100:.2f}% ({correct_count}/{total_eval})")
 
@@ -476,6 +556,7 @@ def _run_mlx(args: argparse.Namespace) -> None:
     list(stream_generate(model, draft, tokenizer, warmup_prompt, block_size, 3, sampler=sampler))
 
     responses = []
+    speed_profiles = []
     correct_count = 0
     total_eval = 0
     for idx in tqdm(range(len(dataset))):
@@ -503,6 +584,11 @@ def _run_mlx(args: argparse.Namespace) -> None:
             output_text = tokenizer.decode(tokens_df)
             messages.append({"role": "assistant", "content": output_text})
             responses.append(response)
+            speed_profiles.append(_make_speed_profile(
+                len(tokenizer.encode(prompt)),
+                Baseline=response[1],
+                DFlash=response[block_size],
+            ))
 
             if "reference" in instance:
                 is_correct = judge_correctness(output_text, instance["reference"], args.dataset)
@@ -518,6 +604,7 @@ def _run_mlx(args: argparse.Namespace) -> None:
                     )
 
     _print_decode_summary(responses, block_size)
+    _print_input_speed_report(speed_profiles, ["Baseline", "DFlash"])
     if total_eval > 0:
         print(f"Accuracy: {correct_count / total_eval * 100:.2f}% ({correct_count}/{total_eval})")
 
@@ -539,16 +626,18 @@ def _run_server(args: argparse.Namespace) -> None:
         ref = item.get("reference")
         
         if is_vllm:
-            prompts_with_refs.append((user_content, ref, user_content))
+            prompts_with_refs.append((user_content, ref, user_content, None))
         else:
+            formatted_prompt = _apply_chat_template(
+                tokenizer,
+                [{"role": "user", "content": user_content}],
+                args.enable_thinking,
+            )
             prompts_with_refs.append((
-                _apply_chat_template(
-                    tokenizer,
-                    [{"role": "user", "content": user_content}],
-                    args.enable_thinking,
-                ),
+                formatted_prompt,
                 ref,
                 user_content,
+                len(tokenizer.encode(formatted_prompt)),
             ))
 
     def send_one(prompt: str) -> dict:
@@ -574,6 +663,11 @@ def _run_server(args: argparse.Namespace) -> None:
             timeout_s=args.timeout_s,
         )
 
+    def send_one_timed(prompt: str) -> tuple[dict, float]:
+        request_start = time.perf_counter()
+        out = send_one(prompt)
+        return out, time.perf_counter() - request_start
+
     if not is_vllm:
         try:
             requests.get(args.base_url + "/flush_cache", timeout=60).raise_for_status()
@@ -594,12 +688,16 @@ def _run_server(args: argparse.Namespace) -> None:
     spec_accept_lengths: list[float] = []
     correct_count = 0
     total_eval = 0
+    speed_profiles = []
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = {pool.submit(send_one, p[0]): (p[1], p[2]) for p in prompts_with_refs}
+        futures = {
+            pool.submit(send_one_timed, p[0]): (p[1], p[2], p[3])
+            for p in prompts_with_refs
+        }
         for fut in tqdm(as_completed(futures), total=len(prompts_with_refs), desc="Benchmarking"):
-            ref, question = futures[fut]
-            out = fut.result()
+            ref, question, estimated_input_tokens = futures[fut]
+            out, request_latency = fut.result()
             
             output_text = ""
             if is_vllm:
@@ -617,16 +715,25 @@ def _run_server(args: argparse.Namespace) -> None:
                     _print_evaluation_sample(question, ref, output_text, is_correct)
             if is_vllm:
                 usage = out.get("usage", {})
-                total_tokens += int(usage.get("completion_tokens", 0))
+                completion_tokens = int(usage.get("completion_tokens", 0))
+                input_tokens = int(usage.get("prompt_tokens", 0) or estimated_input_tokens or 0)
+                total_tokens += completion_tokens
             else:
                 meta = out.get("meta_info", {}) or {}
-                total_tokens += int(meta.get("completion_tokens", 0))
+                completion_tokens = int(meta.get("completion_tokens", 0))
+                input_tokens = int(meta.get("prompt_tokens", 0) or estimated_input_tokens or 0)
+                total_tokens += completion_tokens
                 spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
                 if "spec_accept_length" in meta:
                     try:
                         spec_accept_lengths.append(float(meta["spec_accept_length"]))
                     except (TypeError, ValueError):
                         pass
+            if input_tokens > 0 and completion_tokens > 0:
+                speed_profiles.append({
+                    "input_tokens": input_tokens,
+                    "series": {args.backend: (completion_tokens, request_latency)},
+                })
 
     latency = time.perf_counter() - start
     toks_per_s = total_tokens / max(latency, 1e-6)
@@ -646,6 +753,7 @@ def _run_server(args: argparse.Namespace) -> None:
     if total_eval > 0:
         print(f"Accuracy:         {correct_count / total_eval * 100:.2f}% ({correct_count}/{total_eval})")
     print(f"{'=' * 50}")
+    _print_input_speed_report(speed_profiles, [args.backend])
 
 
 def main() -> None:
