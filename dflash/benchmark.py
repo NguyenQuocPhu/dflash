@@ -296,6 +296,71 @@ def _print_input_speed_report(profiles: list[dict], labels: list[str]) -> None:
     print(table)
 
 
+def _print_server_input_report(profiles: list[dict], backend: str) -> None:
+    if not profiles:
+        return
+
+    grouped: dict[int, dict] = {}
+    for profile in profiles:
+        bucket_start, bucket_label = _input_token_bucket(profile["input_tokens"])
+        group = grouped.setdefault(
+            bucket_start,
+            {
+                "label": bucket_label,
+                "input_tokens": [],
+                "latency": 0.0,
+                "output_tokens": 0,
+                "correct": 0,
+                "evaluated": 0,
+                "accept_lengths": [],
+                "spec_verify_ct": 0,
+            },
+        )
+        group["input_tokens"].append(profile["input_tokens"])
+        group["latency"] += profile["latency"]
+        group["output_tokens"] += profile["output_tokens"]
+        if profile["correct"] is not None:
+            group["evaluated"] += 1
+            group["correct"] += int(profile["correct"])
+        if profile["accept_length"] is not None:
+            group["accept_lengths"].append(profile["accept_length"])
+        group["spec_verify_ct"] += profile["spec_verify_ct"]
+
+    table = Table(title=f"{backend} metrics by input length")
+    for name in (
+        "Input tokens", "Prompts", "Avg input", "Request time (s)",
+        "Output tokens", "Throughput (tok/s)", "Accuracy", "Accept length", "Spec verify ct",
+    ):
+        table.add_column(name, justify="right")
+
+    for bucket_start in sorted(grouped):
+        group = grouped[bucket_start]
+        latency = group["latency"]
+        output_tokens = group["output_tokens"]
+        throughput = output_tokens / latency if latency > 0 else 0.0
+        accuracy = (
+            f"{group['correct'] / group['evaluated'] * 100:.2f}%"
+            if group["evaluated"] > 0 else "-"
+        )
+        accept_length = (
+            f"{statistics.mean(group['accept_lengths']):.3f}"
+            if group["accept_lengths"] else "-"
+        )
+        table.add_row(
+            group["label"],
+            str(len(group["input_tokens"])),
+            f"{statistics.mean(group['input_tokens']):.1f}",
+            f"{latency:.1f}",
+            str(output_tokens),
+            f"{throughput:,.2f}",
+            accuracy,
+            accept_length,
+            str(group["spec_verify_ct"]),
+        )
+
+    print(table)
+
+
 def _print_decode_summary(responses: list[dict[int, SimpleNamespace]], block_size: int) -> None:
     baseline_tpot = np.mean([r[1].time_per_output_token for r in responses])
     dflash_tpot = np.mean([r[block_size].time_per_output_token for r in responses])
@@ -706,6 +771,7 @@ def _run_server(args: argparse.Namespace) -> None:
             else:
                 output_text = out.get("text", "")
             
+            is_correct = None
             if ref is not None:
                 is_correct = judge_correctness(output_text, ref, args.dataset)
                 if is_correct:
@@ -717,22 +783,35 @@ def _run_server(args: argparse.Namespace) -> None:
                 usage = out.get("usage", {})
                 completion_tokens = int(usage.get("completion_tokens", 0))
                 input_tokens = int(usage.get("prompt_tokens", 0) or estimated_input_tokens or 0)
+                accept_length = None
+                spec_verify_ct = 0
                 total_tokens += completion_tokens
             else:
                 meta = out.get("meta_info", {}) or {}
                 completion_tokens = int(meta.get("completion_tokens", 0))
                 input_tokens = int(meta.get("prompt_tokens", 0) or estimated_input_tokens or 0)
+                accept_length = None
+                try:
+                    if "spec_accept_length" in meta:
+                        accept_length = float(meta["spec_accept_length"])
+                except (TypeError, ValueError):
+                    pass
+                spec_verify_ct = int(meta.get("spec_verify_ct", 0))
                 total_tokens += completion_tokens
-                spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
+                spec_verify_ct_sum += spec_verify_ct
                 if "spec_accept_length" in meta:
                     try:
                         spec_accept_lengths.append(float(meta["spec_accept_length"]))
                     except (TypeError, ValueError):
                         pass
-            if input_tokens > 0 and completion_tokens > 0:
+            if input_tokens > 0:
                 speed_profiles.append({
                     "input_tokens": input_tokens,
-                    "series": {args.backend: (completion_tokens, request_latency)},
+                    "latency": request_latency,
+                    "output_tokens": completion_tokens,
+                    "correct": is_correct,
+                    "accept_length": accept_length,
+                    "spec_verify_ct": spec_verify_ct,
                 })
 
     latency = time.perf_counter() - start
@@ -753,7 +832,7 @@ def _run_server(args: argparse.Namespace) -> None:
     if total_eval > 0:
         print(f"Accuracy:         {correct_count / total_eval * 100:.2f}% ({correct_count}/{total_eval})")
     print(f"{'=' * 50}")
-    _print_input_speed_report(speed_profiles, [args.backend])
+    _print_server_input_report(speed_profiles, args.backend)
 
 
 def main() -> None:
