@@ -10,7 +10,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV PATH="${VIRTUAL_ENV}/bin:/root/.local/bin:${CUDA_HOME}/bin:${PATH}" \
     LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 
-# Công cụ cần để uv build vLLM từ source sau này.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
@@ -26,21 +25,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CC=/usr/bin/gcc-11 \
     CXX=/usr/bin/g++-11
 
-# Cài uv.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Tạo Python và virtual environment riêng.
 RUN uv python install "${PYTHON_VERSION}" && \
     uv venv "${VIRTUAL_ENV}" \
         --python "${PYTHON_VERSION}" \
         --seed
 
-# Copy source DFlash vào image.
 WORKDIR /workspace/dflash
 COPY . .
 
-# Chỉ cài DFlash base, KHÔNG cài extra [vllm].
+# Cài DFlash base.
 RUN uv pip install -e .
 
-# Giữ container chạy để có thể docker exec vào.
+# Cài chính xác phiên bản vLLM mà bài chấm yêu cầu.
+RUN uv pip install "vllm==0.22.1"
+
+# Kiểm tra ngay trong lúc build.
+RUN python3 -c "\
+import sys, vllm, torch; \
+print('Python:', sys.executable); \
+print('vLLM:', vllm.__version__); \
+print('PyTorch:', torch.__version__); \
+print('PyTorch CUDA:', torch.version.cuda)"
+
+# Kiểm tra module entrypoint mà hệ thống chấm sẽ gọi.
+RUN python3 -m vllm.entrypoints.openai.api_server --help >/dev/null
+
 CMD ["sleep", "infinity"]
