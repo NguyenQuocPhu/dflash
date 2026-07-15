@@ -41,15 +41,3 @@ RUN uv pip install -e .
 # Cài chính xác phiên bản vLLM mà bài chấm yêu cầu.
 RUN uv pip install "vllm==0.22.1"
 
-# Kiểm tra ngay trong lúc build.
-RUN python3 -c "\
-import sys, vllm, torch; \
-print('Python:', sys.executable); \
-print('vLLM:', vllm.__version__); \
-print('PyTorch:', torch.__version__); \
-print('PyTorch CUDA:', torch.version.cuda)"
-
-# Kiểm tra module entrypoint mà hệ thống chấm sẽ gọi.
-RUN python3 -m vllm.entrypoints.openai.api_server --help >/dev/null
-
-CMD ["sleep", "infinity"]
