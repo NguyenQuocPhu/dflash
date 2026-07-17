@@ -2,7 +2,7 @@ services:
   # Tên dịch vụ (có thể đặt tùy ý, ví dụ: gpu-workspace)
   gpu-workspace:
     # 1. Chỉ định nơi Docker Compose tìm file Dockerfile để tự động build
-    image: nguyenquocphu/dflash-env
+    image: nguyenquocphu/cuda13-vllm
     # 2. Đặt tên cho container cho dễ nhìn thay vì chuỗi ID ngẫu nhiên
     container_name: dflash-dev-env
     
@@ -13,11 +13,11 @@ services:
           devices:
             - driver: nvidia
               # Đã chọn device_ids thì KHÔNG ĐƯỢC dùng count: all nữa
-              device_ids: ['1']
+              device_ids: ['0']
               capabilities: [gpu]
         # Thêm giới hạn RAM ở đây (máy bạn có 7.4GB, 80% là khoảng 6GB)
         limits:
-          memory: 30G
+          memory: 45G
     
     # 5. Map port (Tương đương cờ -p)
     ports:
